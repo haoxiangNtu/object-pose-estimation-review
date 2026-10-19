@@ -1,0 +1,37 @@
+import {spawn} from 'node:child_process';
+import {writeFile,mkdir} from 'node:fs/promises';
+import {fileURLToPath,pathToFileURL} from 'node:url';
+import {resolve,dirname} from 'node:path';
+import assert from 'node:assert/strict';
+const root=resolve(dirname(fileURLToPath(import.meta.url)),'..'),qa=resolve(root,'.qa');
+await mkdir(qa,{recursive:true});
+const target=process.env.QA_URL||pathToFileURL(resolve(root,'docs/index.html')).href;
+const chrome=spawn(process.env.CHROME_BIN||'/opt/google/chrome/chrome',['--headless','--no-sandbox','--disable-gpu','--disable-background-networking','--no-first-run',`--user-data-dir=${resolve(qa,'browser')}`,'--remote-debugging-port=0',target],{stdio:['ignore','ignore','pipe']});
+let ws;const errors=[];
+try{
+ const endpoint=await new Promise((resolve,reject)=>{let log='';const t=setTimeout(()=>reject(Error('browser startup timeout')),15000);chrome.stderr.on('data',b=>{log+=b;const m=log.match(/DevTools listening on (ws:\/\/[^\s]+)/);if(m){clearTimeout(t);resolve(m[1])}});chrome.on('error',reject)});
+ const pages=await fetch(`http://${new URL(endpoint).host}/json/list`).then(r=>r.json());ws=new WebSocket(pages.find(p=>p.type==='page').webSocketDebuggerUrl);await new Promise((res,rej)=>{ws.onopen=res;ws.onerror=rej});
+ let id=0;const pending=new Map();ws.onmessage=e=>{const r=JSON.parse(e.data);if(r.method==='Runtime.exceptionThrown')errors.push(r.params);if(r.id){const p=pending.get(r.id);pending.delete(r.id);r.error?p.reject(r.error):p.resolve(r.result)}};
+ const call=(method,params={})=>new Promise((resolve,reject)=>{const n=++id;pending.set(n,{resolve,reject});ws.send(JSON.stringify({id:n,method,params}))});
+ await call('Runtime.enable');const ev=async expression=>{const r=await call('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true});assert.equal(r.exceptionDetails,undefined,JSON.stringify(r.exceptionDetails));return r.result.value};
+ await call('Emulation.setDeviceMetricsOverride',{width:1440,height:1100,deviceScaleFactor:1,mobile:false});
+ await ev(`new Promise((resolve,reject)=>{const start=Date.now();const t=setInterval(()=>{if(window.REVIEW_TEST?.count()===6){clearInterval(t);resolve(true)}else if(Date.now()-start>15000){clearInterval(t);reject(Error('content load timeout'))}},50)})`);
+ assert.equal(await ev('document.querySelectorAll("#sourcesList li").length'),6);
+ assert.equal(await ev('document.querySelectorAll("#experiment tr").length'),6);
+ await ev('document.getElementById("route").value="rgbd";REVIEW_TEST.render()');assert.equal(await ev('REVIEW_TEST.count()'),3);
+ await ev('document.getElementById("year").value="2026";REVIEW_TEST.render()');assert.equal(await ev('REVIEW_TEST.count()'),1);
+ assert.equal(await ev('document.querySelector(".card h3").textContent'),'WAPR');
+ await ev('document.getElementById("search").value="nonexistentmodel";REVIEW_TEST.render()');assert.equal(await ev('document.getElementById("empty").hidden'),false);
+ await ev('document.getElementById("reset").click()');assert.equal(await ev('REVIEW_TEST.count()'),6);
+ await ev('document.getElementById("outlier").click()');assert.equal(await ev('document.getElementById("demoBox").getAttribute("height")'),'90');
+ assert.match(await ev('document.getElementById("demoStatus").textContent'),/不执行/);
+ await ev('document.getElementById("outlier").click()');assert.equal(await ev('document.getElementById("demoBox").getAttribute("height")'),'250');
+ assert.equal(await ev(`Array.from(document.querySelectorAll('a')).filter(a=>a.getAttribute('href').startsWith('#')).every(a=>a.getAttribute('href')==='#'||document.getElementById(a.hash.slice(1)))`),true);
+ assert.equal(await ev('Array.from(document.querySelectorAll("script[src]")).every(s=>new URL(s.src).origin===location.origin)'),true);
+ const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});await writeFile(resolve(qa,'desktop.png'),Buffer.from(shot.data,'base64'));
+ await call('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
+ assert.equal(await ev('document.documentElement.scrollWidth <= 390'),true);
+ const mobile=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});await writeFile(resolve(qa,'mobile.png'),Buffer.from(mobile.data,'base64'));
+ assert.equal(errors.length,0,JSON.stringify(errors));
+ console.log('PASS: six research cards, sources/results, combined filters/search/reset, no-result state, schematic toggle, anchors, no third-party scripts, mobile layout, no JS exceptions.');
+}finally{ws?.close();chrome.kill('SIGTERM')}
